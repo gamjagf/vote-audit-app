@@ -3,7 +3,8 @@ import streamlit as st
 import pandas as pd
 from PIL import Image
 import re
-import numpy as np
+import requests
+from io import BytesIO
 
 st.set_page_config(
     page_title="투표록 7개 선거 OCR 자동심사 앱",
@@ -61,72 +62,56 @@ def extract_numbers_from_text(text):
             pass
     return out
 
-def preprocess_images_for_ocr(image):
+def run_ocr_space(image):
     """
-    OCR 실패를 줄이기 위해 원본, 확대본, 흑백 대비본, 이진화본을 모두 만든다.
+    OCR.Space API를 이용한 가벼운 OCR 방식.
+    EasyOCR처럼 무거운 라이브러리를 설치하지 않으므로 Streamlit Cloud 배포 실패 가능성이 낮다.
     """
-    import cv2
+    api_key = st.secrets.get("OCR_SPACE_API_KEY", "helloworld")
 
-    rgb = np.array(image.convert("RGB"))
-    variants = []
+    # 이미지 용량 줄이기
+    img = image.convert("RGB")
+    max_width = 1800
+    if img.width > max_width:
+        ratio = max_width / img.width
+        img = img.resize((max_width, int(img.height * ratio)))
 
-    # 1. 원본
-    variants.append(("원본", rgb))
+    buffer = BytesIO()
+    img.save(buffer, format="JPEG", quality=90)
+    buffer.seek(0)
 
-    # 2. 2배 확대
-    enlarged = cv2.resize(rgb, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    variants.append(("2배 확대", enlarged))
+    payload = {
+        "apikey": api_key,
+        "language": "kor",
+        "isOverlayRequired": False,
+        "OCREngine": 2,
+        "scale": True,
+        "detectOrientation": True,
+    }
 
-    # 3. 흑백 + 대비 향상
-    gray = cv2.cvtColor(enlarged, cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    contrast = clahe.apply(gray)
-    variants.append(("흑백 대비 보정", contrast))
+    files = {
+        "file": ("vote_log.jpg", buffer, "image/jpeg")
+    }
 
-    # 4. adaptive threshold
-    th = cv2.adaptiveThreshold(
-        contrast,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        11
+    response = requests.post(
+        "https://api.ocr.space/parse/image",
+        data=payload,
+        files=files,
+        timeout=60
     )
-    variants.append(("이진화 보정", th))
+    data = response.json()
 
-    # 5. 약한 샤프닝
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharp = cv2.filter2D(contrast, -1, kernel)
-    variants.append(("선명도 보정", sharp))
+    if data.get("IsErroredOnProcessing"):
+        error_msg = data.get("ErrorMessage", data.get("ErrorDetails", "OCR 처리 오류"))
+        raise RuntimeError(str(error_msg))
 
-    return variants
+    parsed = data.get("ParsedResults", [])
+    if not parsed:
+        return "", []
 
-@st.cache_resource
-def load_easyocr_reader():
-    import easyocr
-    # 숫자 위주라 en을 먼저 사용하고, 한글이 섞인 문서라 ko도 함께 사용
-    return easyocr.Reader(['en', 'ko'], gpu=False)
-
-def run_ocr(image):
-    reader = load_easyocr_reader()
-    variants = preprocess_images_for_ocr(image)
-
-    all_text_parts = []
-    all_numbers = []
-
-    for name, img in variants:
-        try:
-            results = reader.readtext(img, detail=0, paragraph=False, contrast_ths=0.05, adjust_contrast=0.7)
-            text = "\n".join(results)
-            nums = extract_numbers_from_text(text)
-
-            all_text_parts.append(f"[{name}]\n{text}")
-            all_numbers.extend(nums)
-        except Exception as e:
-            all_text_parts.append(f"[{name}] OCR 실패: {e}")
-
-    # 중복은 유지하되 너무 짧은 잡음 제거: 0,1도 필요할 수 있어 유지
-    return "\n\n".join(all_text_parts), all_numbers
+    text = "\n".join([p.get("ParsedText", "") for p in parsed])
+    numbers = extract_numbers_from_text(text)
+    return text, numbers
 
 def make_default_table():
     elections = [
@@ -160,10 +145,9 @@ def make_default_table():
 def auto_fill_from_numbers(numbers):
     df = make_default_table()
 
-    # 1~6자리 숫자만 사용
     candidates = [n for n in numbers if 0 <= n <= 999999]
 
-    # 수령매수 후보: 500~20000 사이의 값 중 가장 자주 나오는 값 우선
+    # 수령매수 후보: 500~20000 사이에서 가장 자주 등장하는 값
     received_pool = [n for n in candidates if 500 <= n <= 20000]
     default_received = 0
     if received_pool:
@@ -173,8 +157,7 @@ def auto_fill_from_numbers(numbers):
     for i in range(len(df)):
         df.loc[i, "수령매수"] = default_received
 
-    # 후보 숫자를 표에 초안 입력
-    # 실제 정확 자동 입력은 다음 단계의 고정좌표 OCR에서 완성
+    # 자동입력 초안: OCR에서 찾은 숫자를 순서대로 배치
     fill_cols = [
         "잔여 시작번호",
         "잔여 끝번호",
@@ -184,10 +167,8 @@ def auto_fill_from_numbers(numbers):
         "선거인명부등재자 기재값",
     ]
 
-    # 0과 1 같은 잡음은 특수유형 칸에 따로 들어갈 수 있어 일단 뒤로 보냄
-    main_candidates = [n for n in candidates if n >= 10]
-    small_candidates = [n for n in candidates if n < 10]
-    ordered = main_candidates + small_candidates
+    # 10 이상 값을 먼저 넣고, 0~9는 뒤로 보냄
+    ordered = [n for n in candidates if n >= 10] + [n for n in candidates if n < 10]
 
     idx = 0
     for r in range(len(df)):
@@ -246,15 +227,23 @@ def audit_table(df):
     return pd.DataFrame(result_rows)
 
 st.markdown('<div class="main-title">🗳️ 투표록 7개 선거<br>OCR 자동심사 앱</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-text">사진을 올리면 여러 이미지 보정 방식으로 OCR 숫자를 자동 인식합니다.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-text">가벼운 OCR API 방식입니다. Streamlit Cloud에서 무거운 OCR 라이브러리를 설치하지 않습니다.</div>', unsafe_allow_html=True)
 
 st.markdown("""
 <div class="notice">
-<b>OCR 보정 강화 버전</b><br>
-① 원본, 확대본, 흑백 대비본, 이진화본, 선명도 보정본을 모두 OCR합니다.<br>
-② 인식된 숫자 목록을 보여줍니다.<br>
-③ 숫자 자동 입력 초안을 만든 뒤 사용자가 확인·수정합니다.<br>
-④ 사진이 흐리거나 숫자가 작으면 OCR 결과가 비어 있을 수 있습니다.
+<b>가벼운 OCR 버전</b><br>
+① EasyOCR를 제거하여 배포 오류를 줄였습니다.<br>
+② 사진을 OCR API로 보내 숫자를 인식합니다.<br>
+③ 인식 숫자 목록을 표에 자동 입력 초안으로 반영합니다.<br>
+④ 숫자는 반드시 원본과 비교해 확인·수정해 주세요.
+</div>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="warn">
+<b>주의</b><br>
+이 버전은 외부 OCR API를 사용합니다. 민감한 실제 선거문서를 테스트할 때는 기관 보안 기준을 먼저 확인해야 합니다.<br>
+정식 업무용은 내부망 OCR 또는 승인된 OCR API로 교체하는 것이 안전합니다.
 </div>
 """, unsafe_allow_html=True)
 
@@ -278,17 +267,12 @@ if uploaded_image is not None:
     image = Image.open(uploaded_image).convert("RGB")
     st.image(image, caption="업로드된 투표록 이미지", use_container_width=True)
 
-    width, height = image.size
-    st.caption(f"이미지 크기: {width} × {height}")
-    if width < 1200 or height < 1200:
-        st.markdown('<div class="warn">사진 해상도가 낮습니다. 숫자가 작거나 흐리면 OCR이 실패할 수 있습니다. 문서 표 부분을 더 크게 촬영해 주세요.</div>', unsafe_allow_html=True)
-
     st.markdown('<div class="step-title">🤖 2. OCR 숫자 자동 인식</div>', unsafe_allow_html=True)
 
     if st.button("🔍 OCR로 숫자 자동 인식하기", use_container_width=True):
-        with st.spinner("OCR 숫자 인식 중입니다. 첫 실행은 EasyOCR 모델 로딩으로 시간이 걸릴 수 있습니다."):
+        with st.spinner("OCR 숫자 인식 중입니다. 네트워크 상태에 따라 시간이 걸릴 수 있습니다."):
             try:
-                full_text, numbers = run_ocr(image)
+                full_text, numbers = run_ocr_space(image)
                 st.session_state.ocr_text = full_text
                 st.session_state.ocr_numbers = numbers
                 st.session_state.input_df = auto_fill_from_numbers(numbers)
@@ -323,9 +307,11 @@ edited_df = st.data_editor(
     num_rows="fixed",
     key="audit_editor"
 )
+
 st.session_state.input_df = edited_df
 
 st.markdown('<div class="step-title">✅ 4. 자동 심사 결과</div>', unsafe_allow_html=True)
+
 result_df = audit_table(edited_df)
 
 ok_count = int((result_df["최종판정"] == "정상").sum())
@@ -351,9 +337,8 @@ st.markdown("""
 <div class="guide">
 1. 숫자가 있는 표 부분을 화면에 크게 채워 촬영해 주세요.<br>
 2. 그림자 없이 밝은 곳에서 촬영해 주세요.<br>
-3. 초점이 맞지 않으면 OCR 결과가 빈 목록 []으로 나옵니다.<br>
-4. 다음 단계의 고정좌표 OCR에서는 양식의 칸 위치를 지정하여 정확도를 더 높일 수 있습니다.<br>
-5. 최종 판단 전에는 반드시 원본 투표록과 대조해 주세요.
+3. 초점이 맞지 않으면 숫자를 잘못 읽거나 읽지 못할 수 있습니다.<br>
+4. 최종 판단 전에는 반드시 원본 투표록과 대조해 주세요.
 </div>
 """, unsafe_allow_html=True)
 
