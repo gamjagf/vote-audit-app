@@ -15,10 +15,11 @@ st.set_page_config(
 st.markdown("""
 <style>
 .block-container {padding-top:1rem; padding-bottom:2rem;}
-.main-title {font-size:2.1rem; font-weight:900; line-height:1.25; color:#252936;}
+.main-title {font-size:2.05rem; font-weight:900; line-height:1.25; color:#252936;}
 .sub-text {font-size:1.05rem; color:#666; line-height:1.7;}
 .notice {background:#eaf4ff; color:#075985; padding:1rem; border-radius:1rem; font-size:1.02rem; line-height:1.7; margin-top:1rem;}
-.step-title {font-size:1.4rem; font-weight:850; margin-top:1.8rem; margin-bottom:.6rem;}
+.warn {background:#fff7ed; color:#9a3412; padding:1rem; border-radius:1rem; font-size:1.02rem; line-height:1.7; margin-top:1rem;}
+.step-title {font-size:1.35rem; font-weight:850; margin-top:1.8rem; margin-bottom:.6rem;}
 .ok-box {background:#eaf8ef; border-left:7px solid #22a35a; padding:1rem; border-radius:1rem; font-size:1.05rem;}
 .bad-box {background:#fff0f0; border-left:7px solid #e5484d; padding:1rem; border-radius:1rem; font-size:1.05rem;}
 .guide {background:#f7f7f8; padding:1rem; border-radius:1rem; line-height:1.8;}
@@ -36,7 +37,7 @@ def to_int(value):
 def clean_number_text(text):
     text = str(text)
     replace_map = {
-        "O": "0", "o": "0",
+        "O": "0", "o": "0", "D": "0",
         "I": "1", "l": "1", "|": "1",
         "S": "5", "s": "5",
         "B": "8",
@@ -50,28 +51,82 @@ def clean_number_text(text):
 def extract_numbers_from_text(text):
     text = clean_number_text(text)
     nums = re.findall(r"\d+", text)
-    result = []
+    out = []
     for n in nums:
         try:
             value = int(n)
-            if value >= 0:
-                result.append(value)
+            if 0 <= value <= 999999:
+                out.append(value)
         except:
             pass
-    return result
+    return out
+
+def preprocess_images_for_ocr(image):
+    """
+    OCR 실패를 줄이기 위해 원본, 확대본, 흑백 대비본, 이진화본을 모두 만든다.
+    """
+    import cv2
+
+    rgb = np.array(image.convert("RGB"))
+    variants = []
+
+    # 1. 원본
+    variants.append(("원본", rgb))
+
+    # 2. 2배 확대
+    enlarged = cv2.resize(rgb, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    variants.append(("2배 확대", enlarged))
+
+    # 3. 흑백 + 대비 향상
+    gray = cv2.cvtColor(enlarged, cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    contrast = clahe.apply(gray)
+    variants.append(("흑백 대비 보정", contrast))
+
+    # 4. adaptive threshold
+    th = cv2.adaptiveThreshold(
+        contrast,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11
+    )
+    variants.append(("이진화 보정", th))
+
+    # 5. 약한 샤프닝
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharp = cv2.filter2D(contrast, -1, kernel)
+    variants.append(("선명도 보정", sharp))
+
+    return variants
 
 @st.cache_resource
 def load_easyocr_reader():
     import easyocr
-    return easyocr.Reader(['ko', 'en'], gpu=False)
+    # 숫자 위주라 en을 먼저 사용하고, 한글이 섞인 문서라 ko도 함께 사용
+    return easyocr.Reader(['en', 'ko'], gpu=False)
 
 def run_ocr(image):
     reader = load_easyocr_reader()
-    img_np = np.array(image)
-    results = reader.readtext(img_np, detail=0, paragraph=False)
-    full_text = "\n".join(results)
-    numbers = extract_numbers_from_text(full_text)
-    return full_text, numbers
+    variants = preprocess_images_for_ocr(image)
+
+    all_text_parts = []
+    all_numbers = []
+
+    for name, img in variants:
+        try:
+            results = reader.readtext(img, detail=0, paragraph=False, contrast_ths=0.05, adjust_contrast=0.7)
+            text = "\n".join(results)
+            nums = extract_numbers_from_text(text)
+
+            all_text_parts.append(f"[{name}]\n{text}")
+            all_numbers.extend(nums)
+        except Exception as e:
+            all_text_parts.append(f"[{name}] OCR 실패: {e}")
+
+    # 중복은 유지하되 너무 짧은 잡음 제거: 0,1도 필요할 수 있어 유지
+    return "\n\n".join(all_text_parts), all_numbers
 
 def make_default_table():
     elections = [
@@ -103,31 +158,24 @@ def make_default_table():
     return pd.DataFrame(rows)
 
 def auto_fill_from_numbers(numbers):
-    """
-    OCR 숫자 목록을 기반으로 자동 입력 후보를 만든다.
-    고정 좌표 OCR 전 단계의 임시 자동 입력 방식이다.
-    실제 양식 보정 후에는 이 부분을 좌표 기반으로 교체한다.
-    """
     df = make_default_table()
 
-    # 자주 나오는 구조 예시:
-    # 수령매수 3500, 교부매수 2903, 잔여매수 597 등이 반복될 가능성을 고려
-    useful = [n for n in numbers if n >= 0]
+    # 1~6자리 숫자만 사용
+    candidates = [n for n in numbers if 0 <= n <= 999999]
 
-    # 3자리~5자리 숫자를 우선 후보로 사용
-    candidates = [n for n in useful if 1 <= n <= 99999]
-
-    # 수령매수 후보: 500 이상 숫자 중 반복값 또는 큰 값
-    received_candidates = [n for n in candidates if n >= 500]
-    default_received = received_candidates[0] if received_candidates else 0
+    # 수령매수 후보: 500~20000 사이의 값 중 가장 자주 나오는 값 우선
+    received_pool = [n for n in candidates if 500 <= n <= 20000]
+    default_received = 0
+    if received_pool:
+        s = pd.Series(received_pool)
+        default_received = int(s.value_counts().index[0])
 
     for i in range(len(df)):
         df.loc[i, "수령매수"] = default_received
 
-    # 숫자를 7개 선거에 순서대로 배분할 수 있도록 후보값을 일부 채움
-    # 정확 자동화가 아니라 "자동 입력 초안" 기능
-    idx = 0
-    cols = [
+    # 후보 숫자를 표에 초안 입력
+    # 실제 정확 자동 입력은 다음 단계의 고정좌표 OCR에서 완성
+    fill_cols = [
         "잔여 시작번호",
         "잔여 끝번호",
         "잔여매수 기재값",
@@ -136,10 +184,16 @@ def auto_fill_from_numbers(numbers):
         "선거인명부등재자 기재값",
     ]
 
-    for row in range(len(df)):
-        for col in cols:
-            if idx < len(candidates):
-                df.loc[row, col] = candidates[idx]
+    # 0과 1 같은 잡음은 특수유형 칸에 따로 들어갈 수 있어 일단 뒤로 보냄
+    main_candidates = [n for n in candidates if n >= 10]
+    small_candidates = [n for n in candidates if n < 10]
+    ordered = main_candidates + small_candidates
+
+    idx = 0
+    for r in range(len(df)):
+        for c in fill_cols:
+            if idx < len(ordered):
+                df.loc[r, c] = int(ordered[idx])
                 idx += 1
 
     return df
@@ -166,19 +220,14 @@ def audit_table(df):
         special_total = home_return + decision_doc + envelope_return + overseas
         calc_registry = written_voters - special_total
 
-        check_left = calc_left == written_left
-        check_issued = calc_issued == written_issued
-        check_voters = written_voters == written_issued
-        check_registry = calc_registry == written_registry
-
         problems = []
-        if not check_left:
+        if calc_left != written_left:
             problems.append(f"잔여매수 불일치: 계산 {calc_left:,} / 기재 {written_left:,}")
-        if not check_issued:
+        if calc_issued != written_issued:
             problems.append(f"교부매수 불일치: 계산 {calc_issued:,} / 기재 {written_issued:,}")
-        if not check_voters:
+        if written_voters != written_issued:
             problems.append(f"투표자수계 불일치: 투표자수계 {written_voters:,} / 교부매수 {written_issued:,}")
-        if not check_registry:
+        if calc_registry != written_registry:
             problems.append(f"선거인명부등재자 불일치: 계산 {calc_registry:,} / 기재 {written_registry:,}")
 
         result_rows.append({
@@ -187,25 +236,25 @@ def audit_table(df):
             "교부매수 계산값": calc_issued,
             "특수유형 합계": special_total,
             "선거인명부등재자 계산값": calc_registry,
-            "잔여검산": "OK" if check_left else "오류",
-            "교부검산": "OK" if check_issued else "오류",
-            "투표자수검산": "OK" if check_voters else "오류",
-            "명부등재자검산": "OK" if check_registry else "오류",
+            "잔여검산": "OK" if calc_left == written_left else "오류",
+            "교부검산": "OK" if calc_issued == written_issued else "오류",
+            "투표자수검산": "OK" if written_voters == written_issued else "오류",
+            "명부등재자검산": "OK" if calc_registry == written_registry else "오류",
             "최종판정": "정상" if not problems else "재확인",
             "비고": "이상 없음" if not problems else " / ".join(problems),
         })
     return pd.DataFrame(result_rows)
 
 st.markdown('<div class="main-title">🗳️ 투표록 7개 선거<br>OCR 자동심사 앱</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-text">사진을 올리면 OCR로 숫자를 자동 인식하고, 인식된 숫자를 바탕으로 7개 선거를 검산합니다.</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-text">사진을 올리면 여러 이미지 보정 방식으로 OCR 숫자를 자동 인식합니다.</div>', unsafe_allow_html=True)
 
 st.markdown("""
 <div class="notice">
-<b>OCR 자동 인식 버전</b><br>
-① 사진에서 숫자를 자동으로 읽습니다.<br>
-② OCR 결과 숫자 목록을 보여줍니다.<br>
-③ 자동 입력 초안을 만들고, 사용자가 확인·수정할 수 있습니다.<br>
-④ 최종 검산은 수정된 표 기준으로 자동 수행됩니다.
+<b>OCR 보정 강화 버전</b><br>
+① 원본, 확대본, 흑백 대비본, 이진화본, 선명도 보정본을 모두 OCR합니다.<br>
+② 인식된 숫자 목록을 보여줍니다.<br>
+③ 숫자 자동 입력 초안을 만든 뒤 사용자가 확인·수정합니다.<br>
+④ 사진이 흐리거나 숫자가 작으면 OCR 결과가 비어 있을 수 있습니다.
 </div>
 """, unsafe_allow_html=True)
 
@@ -229,16 +278,25 @@ if uploaded_image is not None:
     image = Image.open(uploaded_image).convert("RGB")
     st.image(image, caption="업로드된 투표록 이미지", use_container_width=True)
 
+    width, height = image.size
+    st.caption(f"이미지 크기: {width} × {height}")
+    if width < 1200 or height < 1200:
+        st.markdown('<div class="warn">사진 해상도가 낮습니다. 숫자가 작거나 흐리면 OCR이 실패할 수 있습니다. 문서 표 부분을 더 크게 촬영해 주세요.</div>', unsafe_allow_html=True)
+
     st.markdown('<div class="step-title">🤖 2. OCR 숫자 자동 인식</div>', unsafe_allow_html=True)
 
     if st.button("🔍 OCR로 숫자 자동 인식하기", use_container_width=True):
-        with st.spinner("OCR 숫자 인식 중입니다. 첫 실행은 시간이 다소 걸릴 수 있습니다."):
+        with st.spinner("OCR 숫자 인식 중입니다. 첫 실행은 EasyOCR 모델 로딩으로 시간이 걸릴 수 있습니다."):
             try:
                 full_text, numbers = run_ocr(image)
                 st.session_state.ocr_text = full_text
                 st.session_state.ocr_numbers = numbers
                 st.session_state.input_df = auto_fill_from_numbers(numbers)
-                st.success("OCR 숫자 인식이 완료되었습니다. 아래 표의 자동 입력값을 확인·수정해 주세요.")
+
+                if len(numbers) == 0:
+                    st.warning("OCR이 숫자를 찾지 못했습니다. 표와 숫자가 더 크게 보이도록 다시 촬영해 주세요.")
+                else:
+                    st.success(f"OCR 숫자 인식 완료: {len(numbers)}개 숫자를 찾았습니다. 아래 표를 확인·수정해 주세요.")
             except Exception as e:
                 st.error("OCR 실행 중 오류가 발생했습니다.")
                 st.write(e)
@@ -265,11 +323,9 @@ edited_df = st.data_editor(
     num_rows="fixed",
     key="audit_editor"
 )
-
 st.session_state.input_df = edited_df
 
 st.markdown('<div class="step-title">✅ 4. 자동 심사 결과</div>', unsafe_allow_html=True)
-
 result_df = audit_table(edited_df)
 
 ok_count = int((result_df["최종판정"] == "정상").sum())
@@ -288,21 +344,15 @@ else:
     st.markdown('<div class="bad-box"><b>재확인 필요한 선거가 있습니다.</b><br>비고란의 불일치 항목을 원본 투표록과 대조해 주세요.</div>', unsafe_allow_html=True)
 
 csv = result_df.to_csv(index=False).encode("utf-8-sig")
-st.download_button(
-    "📄 심사결과 CSV 다운로드",
-    data=csv,
-    file_name="투표록_심사결과.csv",
-    mime="text/csv",
-    use_container_width=True
-)
+st.download_button("📄 심사결과 CSV 다운로드", data=csv, file_name="투표록_심사결과.csv", mime="text/csv", use_container_width=True)
 
 st.markdown('<div class="step-title">📌 촬영 안내</div>', unsafe_allow_html=True)
 st.markdown("""
 <div class="guide">
-1. 문서를 책상 위에 평평하게 놓아 주세요.<br>
-2. 그림자가 생기지 않도록 밝은 곳에서 촬영해 주세요.<br>
-3. 표 전체가 화면 안에 들어오도록 촬영해 주세요.<br>
-4. 숫자가 흐리게 보이면 OCR 인식률이 낮아집니다.<br>
+1. 숫자가 있는 표 부분을 화면에 크게 채워 촬영해 주세요.<br>
+2. 그림자 없이 밝은 곳에서 촬영해 주세요.<br>
+3. 초점이 맞지 않으면 OCR 결과가 빈 목록 []으로 나옵니다.<br>
+4. 다음 단계의 고정좌표 OCR에서는 양식의 칸 위치를 지정하여 정확도를 더 높일 수 있습니다.<br>
 5. 최종 판단 전에는 반드시 원본 투표록과 대조해 주세요.
 </div>
 """, unsafe_allow_html=True)
